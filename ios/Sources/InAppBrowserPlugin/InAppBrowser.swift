@@ -364,11 +364,90 @@ extension InAppBrowserViewController: WKNavigationDelegate {
 
         decisionHandler(.allow)
     }
+
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let protectionSpace = challenge.protectionSpace
+
+        if protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            guard let serverTrust = protectionSpace.serverTrust else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+            // Only prompt if the certificate actually fails evaluation
+            var error: CFError?
+            if SecTrustEvaluateWithError(serverTrust, &error) {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            let alert = UIAlertController(
+                title: "Certificate Error",
+                message: "The certificate for \(protectionSpace.host) is not valid. Do you want to continue?",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            })
+            alert.addAction(UIAlertAction(title: "Continue", style: .destructive) { _ in
+                completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            })
+            presentSafely(alert) {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
+            return
+        }
+
+        if protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPBasic ||
+            protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPDigest {
+            let alert = UIAlertController(
+                title: "Authentication Required",
+                message: "Log in to \(protectionSpace.host)",
+                preferredStyle: .alert
+            )
+            alert.addTextField { $0.placeholder = "Username" }
+            alert.addTextField { $0.placeholder = "Password"; $0.isSecureTextEntry = true }
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            })
+            alert.addAction(UIAlertAction(title: "Log In", style: .default) { _ in
+                let username = alert.textFields?[0].text ?? ""
+                let password = alert.textFields?[1].text ?? ""
+                completionHandler(.useCredential, URLCredential(user: username, password: password, persistence: .forSession))
+            })
+            presentSafely(alert) {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
+            return
+        }
+
+        completionHandler(.performDefaultHandling, nil)
+    }
+
+    private func presentSafely(_ vc: UIViewController, fallback: @escaping () -> Void) {
+        if presentedViewController != nil || !isViewLoaded || view.window == nil {
+            fallback()
+            return
+        }
+        present(vc, animated: true)
+    }
 }
 
 // MARK: - WKUIDelegate
 
 extension InAppBrowserViewController: WKUIDelegate {
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        webView.load(navigationAction.request)
+        return nil
+    }
 
     func webView(
         _ webView: WKWebView,
