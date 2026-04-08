@@ -43,6 +43,7 @@
     "build": "pnpm run clean && pnpm run docgen && tsc && rollup -c rollup.config.mjs",
     "clean": "rimraf ./dist",
     "watch": "tsc --watch",
+    "prepare": "pnpm run build",
     "prepublishOnly": "pnpm run build"
   },
   "devDependencies": {
