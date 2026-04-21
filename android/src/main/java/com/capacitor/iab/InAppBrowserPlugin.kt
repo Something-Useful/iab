@@ -20,30 +20,20 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
             return
         }
 
-        val toolbarColor = call.getString("toolbarColor")?.let { parseHexColor(it) }
-        val title = call.getString("title")
-        val closeButtonText = call.getString("closeButtonText") ?: "Done"
-        val showNav = call.getBoolean("showNavigationButtons") ?: true
-        val showUrl = call.getBoolean("showUrlBar") ?: true
-
-        val headers: Map<String, String>? = call.getObject("headers")?.let { obj ->
-            val map = mutableMapOf<String, String>()
-            val keys = obj.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                (obj.opt(key) as? String)?.let { map[key] = it }
-            }
-            map
+        val headers = call.getObject("headers")?.let { obj ->
+            obj.keys().asSequence()
+                .mapNotNull { key -> (obj.opt(key) as? String)?.let { key to it } }
+                .toMap()
         }
 
         val options = InAppBrowserOptions(
             url = url,
             headers = headers,
-            toolbarColor = toolbarColor,
-            title = title,
-            closeButtonText = closeButtonText,
-            showNavigationButtons = showNav,
-            showUrlBar = showUrl
+            toolbarColor = call.getString("toolbarColor")?.let { parseHexColor(it) },
+            title = call.getString("title"),
+            closeButtonText = call.getString("closeButtonText") ?: "Done",
+            showNavigationButtons = call.getBoolean("showNavigationButtons") ?: true,
+            showUrlBar = call.getBoolean("showUrlBar") ?: true
         )
 
         activity.runOnUiThread {
@@ -69,13 +59,8 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
 
     @PluginMethod
     fun executeScript(call: PluginCall) {
-        val code = call.getString("code")
-        if (code == null) {
-            call.reject("Missing 'code'")
-            return
-        }
-        activity.runOnUiThread {
-            val dialog = browserDialog ?: return@runOnUiThread call.reject("No browser open")
+        val code = call.getString("code") ?: return call.reject("Missing 'code'")
+        withBrowser(call) { dialog ->
             dialog.executeScript(code) { result ->
                 result.fold(
                     onSuccess = { call.resolve(JSObject().put("result", it)) },
@@ -87,13 +72,8 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
 
     @PluginMethod
     fun insertCSS(call: PluginCall) {
-        val code = call.getString("code")
-        if (code == null) {
-            call.reject("Missing 'code'")
-            return
-        }
-        activity.runOnUiThread {
-            val dialog = browserDialog ?: return@runOnUiThread call.reject("No browser open")
+        val code = call.getString("code") ?: return call.reject("Missing 'code'")
+        withBrowser(call) { dialog ->
             dialog.insertCSS(code) { result ->
                 result.fold(
                     onSuccess = { call.resolve() },
@@ -105,33 +85,21 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
 
     @PluginMethod
     fun addUserScript(call: PluginCall) {
-        val code = call.getString("code")
-        if (code == null) {
-            call.reject("Missing 'code'")
-            return
-        }
-        val timing = call.getString("injectionTime")
-        val atDocumentStart = when (timing) {
+        val code = call.getString("code") ?: return call.reject("Missing 'code'")
+        val atDocumentStart = when (call.getString("injectionTime")) {
             "atDocumentStart" -> true
             "atDocumentEnd" -> false
-            else -> {
-                call.reject("Invalid injectionTime: must be 'atDocumentStart' or 'atDocumentEnd'")
-                return
-            }
+            else -> return call.reject("Invalid injectionTime: must be 'atDocumentStart' or 'atDocumentEnd'")
         }
-
-        activity.runOnUiThread {
-            val dialog = browserDialog ?: return@runOnUiThread call.reject("No browser open")
-            val ok = dialog.addUserScript(code, atDocumentStart)
-            if (ok) call.resolve()
+        withBrowser(call) { dialog ->
+            if (dialog.addUserScript(code, atDocumentStart)) call.resolve()
             else call.reject("Document start script injection not supported on this WebView version")
         }
     }
 
     @PluginMethod
     fun removeAllUserScripts(call: PluginCall) {
-        activity.runOnUiThread {
-            val dialog = browserDialog ?: return@runOnUiThread call.reject("No browser open")
+        withBrowser(call) { dialog ->
             dialog.removeAllUserScripts()
             call.resolve()
         }
@@ -142,16 +110,20 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
         dismissBrowser()
     }
 
-    private fun dismissBrowser() {
-        browserDialog?.let { dialog ->
-            dialog.cleanup()
-            try { dialog.dismiss() } catch (_: Exception) { }
-            browserDialog = null
-            notifyListeners("exit", JSObject())
+    private fun withBrowser(call: PluginCall, body: (InAppBrowserDialog) -> Unit) {
+        activity.runOnUiThread {
+            val dialog = browserDialog ?: return@runOnUiThread call.reject("No browser open")
+            body(dialog)
         }
     }
 
-    // MARK: - InAppBrowserDelegate
+    private fun dismissBrowser() {
+        val dialog = browserDialog ?: return
+        dialog.cleanup()
+        if (dialog.isShowing) dialog.dismiss()
+        browserDialog = null
+        notifyListeners("exit", JSObject())
+    }
 
     override fun onLoadStart(url: String) {
         notifyListeners("loadstart", JSObject().put("url", url))
@@ -181,7 +153,7 @@ class InAppBrowserPlugin : Plugin(), InAppBrowserDelegate {
             var s = hex.trim()
             if (!s.startsWith("#")) s = "#$s"
             Color.parseColor(s)
-        } catch (_: Exception) {
+        } catch (_: IllegalArgumentException) {
             null
         }
     }

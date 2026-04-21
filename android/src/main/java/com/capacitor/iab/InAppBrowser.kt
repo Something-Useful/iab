@@ -3,12 +3,13 @@ package com.capacitor.iab
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.app.Dialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.net.http.SslError
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,7 +20,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
-import android.webkit.ConsoleMessage
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.HttpAuthHandler
 import android.webkit.JavascriptInterface
@@ -29,7 +30,6 @@ import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -81,22 +81,25 @@ class InAppBrowserDialog(
 
     private val pendingScripts = mutableMapOf<String, (Result<String>) -> Unit>()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val documentEndScripts = mutableListOf<String>()
+    private val documentStartHandlers = mutableListOf<ScriptHandler>()
 
     companion object {
         const val BRIDGE_NAME = "IabBridge"
         // Shim so page JS can use iOS-style window.webkit.messageHandlers.iab.postMessage(data)
-        private const val POST_MESSAGE_SHIM = """
+        private val POST_MESSAGE_SHIM = """
             (function() {
                 if (!window.webkit) window.webkit = {};
                 if (!window.webkit.messageHandlers) window.webkit.messageHandlers = {};
                 window.webkit.messageHandlers.iab = {
                     postMessage: function(d) {
                         var s = typeof d === 'string' ? d : JSON.stringify(d);
-                        IabBridge.postMessage(s);
+                        $BRIDGE_NAME.postMessage(s);
                     }
                 };
             })();
         """
+        private val EXTERNAL_SCHEMES = setOf("tel", "mailto", "sms", "geo", "market", "intent")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -214,7 +217,7 @@ class InAppBrowserDialog(
                 setTextColor(Color.GRAY)
                 setPadding(dp(12), dp(8), dp(12), dp(8))
                 isEnabled = false
-                setOnClickListener { if (webView.canGoBack()) webView.goBack() }
+                setOnClickListener { webView.goBack() }
             }
             toolbar.addView(backButton)
 
@@ -224,7 +227,7 @@ class InAppBrowserDialog(
                 setTextColor(Color.GRAY)
                 setPadding(dp(12), dp(8), dp(12), dp(8))
                 isEnabled = false
-                setOnClickListener { if (webView.canGoForward()) webView.goForward() }
+                setOnClickListener { webView.goForward() }
             }
             toolbar.addView(forwardButton)
         }
@@ -247,9 +250,8 @@ class InAppBrowserDialog(
             setAcceptThirdPartyCookies(webView, true)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            WebView.setWebContentsDebuggingEnabled(true)
-        }
+        val debuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (debuggable) WebView.setWebContentsDebuggingEnabled(true)
 
         webView.addJavascriptInterface(JsBridge(), BRIDGE_NAME)
         webView.webViewClient = BrowserNavigationClient()
@@ -331,18 +333,19 @@ class InAppBrowserDialog(
         documentStartHandlers.clear()
     }
 
-    private val documentEndScripts = mutableListOf<String>()
-    private val documentStartHandlers = mutableListOf<ScriptHandler>()
-
     fun cleanup() {
-        try {
-            webView.stopLoading()
-            webView.removeJavascriptInterface(BRIDGE_NAME)
-            webView.webViewClient = WebViewClient()
-            webView.webChromeClient = null
-            (webView.parent as? ViewGroup)?.removeView(webView)
-            webView.destroy()
-        } catch (_: Exception) { }
+        pendingScripts.values.forEach {
+            it(Result.failure(RuntimeException("Browser closed")))
+        }
+        pendingScripts.clear()
+        removeAllUserScripts()
+        mainHandler.removeCallbacksAndMessages(null)
+        webView.stopLoading()
+        webView.removeJavascriptInterface(BRIDGE_NAME)
+        webView.webViewClient = WebViewClient()
+        webView.webChromeClient = null
+        (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.destroy()
         CookieManager.getInstance().flush()
     }
 
@@ -352,8 +355,6 @@ class InAppBrowserDialog(
             value.toFloat(),
             context.resources.displayMetrics
         ).toInt()
-
-    // MARK: - JS Bridge
 
     private inner class JsBridge {
         @JavascriptInterface
@@ -376,13 +377,20 @@ class InAppBrowserDialog(
         }
     }
 
-    // MARK: - Navigation Client
+    private fun showSafely(builder: AlertDialog.Builder, onFail: () -> Unit) {
+        try {
+            builder.show()
+        } catch (_: WindowManager.BadTokenException) {
+            onFail()
+        } catch (_: IllegalStateException) {
+            onFail()
+        }
+    }
 
     private inner class BrowserNavigationClient : WebViewClient() {
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             progressBar.visibility = View.VISIBLE
-            // Fallback for WebView versions that don't support DOCUMENT_START_SCRIPT
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 view.evaluateJavascript(POST_MESSAGE_SHIM, null)
             }
@@ -406,10 +414,11 @@ class InAppBrowserDialog(
         ) {
             if (!request.isForMainFrame) return
             progressBar.visibility = View.GONE
-            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.errorCode else -1
-            val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                error.description?.toString() ?: "" else ""
-            delegate?.onLoadError(request.url.toString(), code, desc)
+            delegate?.onLoadError(
+                request.url.toString(),
+                error.errorCode,
+                error.description?.toString() ?: ""
+            )
         }
 
         override fun shouldOverrideUrlLoading(
@@ -418,30 +427,23 @@ class InAppBrowserDialog(
         ): Boolean {
             val url = request.url
             val scheme = url.scheme?.lowercase() ?: ""
-            if (scheme in listOf("tel", "mailto", "sms", "geo", "market", "intent")) {
-                try {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, url).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    })
-                } catch (_: Exception) { }
-                return true
-            }
-            return false
+            if (scheme !in EXTERNAL_SCHEMES) return false
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, url).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+            } catch (_: ActivityNotFoundException) { }
+            return true
         }
 
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
-            val alert = AlertDialog.Builder(hostActivity)
+            val builder = AlertDialog.Builder(hostActivity)
                 .setTitle("Certificate Error")
                 .setMessage("The certificate for ${error.url} is not valid. Do you want to continue?")
                 .setNegativeButton("Cancel") { _, _ -> handler.cancel() }
                 .setPositiveButton("Continue") { _, _ -> handler.proceed() }
                 .setOnCancelListener { handler.cancel() }
-                .create()
-            try {
-                alert.show()
-            } catch (_: Exception) {
-                handler.cancel()
-            }
+            showSafely(builder) { handler.cancel() }
         }
 
         override fun onReceivedHttpAuthRequest(
@@ -450,23 +452,22 @@ class InAppBrowserDialog(
             host: String,
             realm: String
         ) {
-            val ctx = hostActivity
-            val container = LinearLayout(ctx).apply {
+            val container = LinearLayout(hostActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(16), dp(8), dp(16), dp(8))
             }
-            val userField = EditText(ctx).apply {
+            val userField = EditText(hostActivity).apply {
                 hint = "Username"
                 inputType = InputType.TYPE_CLASS_TEXT
             }
-            val passField = EditText(ctx).apply {
+            val passField = EditText(hostActivity).apply {
                 hint = "Password"
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
             container.addView(userField)
             container.addView(passField)
 
-            val alert = AlertDialog.Builder(ctx)
+            val builder = AlertDialog.Builder(hostActivity)
                 .setTitle("Authentication Required")
                 .setMessage("Log in to $host")
                 .setView(container)
@@ -475,21 +476,9 @@ class InAppBrowserDialog(
                     handler.proceed(userField.text.toString(), passField.text.toString())
                 }
                 .setOnCancelListener { handler.cancel() }
-                .create()
-            try {
-                alert.show()
-            } catch (_: Exception) {
-                handler.cancel()
-            }
+            showSafely(builder) { handler.cancel() }
         }
-
-        override fun shouldInterceptRequest(
-            view: WebView,
-            request: WebResourceRequest
-        ): WebResourceResponse? = null
     }
-
-    // MARK: - Chrome Client
 
     private inner class BrowserChromeClient : WebChromeClient() {
 
@@ -507,15 +496,11 @@ class InAppBrowserDialog(
             message: String,
             result: JsResult
         ): Boolean {
-            try {
-                AlertDialog.Builder(hostActivity)
-                    .setMessage(message)
-                    .setPositiveButton("OK") { _, _ -> result.confirm() }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
-            } catch (_: Exception) {
-                result.cancel()
-            }
+            val builder = AlertDialog.Builder(hostActivity)
+                .setMessage(message)
+                .setPositiveButton("OK") { _, _ -> result.confirm() }
+                .setOnCancelListener { result.cancel() }
+            showSafely(builder) { result.cancel() }
             return true
         }
 
@@ -525,16 +510,12 @@ class InAppBrowserDialog(
             message: String,
             result: JsResult
         ): Boolean {
-            try {
-                AlertDialog.Builder(hostActivity)
-                    .setMessage(message)
-                    .setNegativeButton("Cancel") { _, _ -> result.cancel() }
-                    .setPositiveButton("OK") { _, _ -> result.confirm() }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
-            } catch (_: Exception) {
-                result.cancel()
-            }
+            val builder = AlertDialog.Builder(hostActivity)
+                .setMessage(message)
+                .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                .setPositiveButton("OK") { _, _ -> result.confirm() }
+                .setOnCancelListener { result.cancel() }
+            showSafely(builder) { result.cancel() }
             return true
         }
 
@@ -548,17 +529,13 @@ class InAppBrowserDialog(
             val input = EditText(hostActivity).apply {
                 setText(defaultValue ?: "")
             }
-            try {
-                AlertDialog.Builder(hostActivity)
-                    .setMessage(message)
-                    .setView(input)
-                    .setNegativeButton("Cancel") { _, _ -> result.cancel() }
-                    .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
-                    .setOnCancelListener { result.cancel() }
-                    .show()
-            } catch (_: Exception) {
-                result.cancel()
-            }
+            val builder = AlertDialog.Builder(hostActivity)
+                .setMessage(message)
+                .setView(input)
+                .setNegativeButton("Cancel") { _, _ -> result.cancel() }
+                .setPositiveButton("OK") { _, _ -> result.confirm(input.text.toString()) }
+                .setOnCancelListener { result.cancel() }
+            showSafely(builder) { result.cancel() }
             return true
         }
 
@@ -568,7 +545,6 @@ class InAppBrowserDialog(
             isUserGesture: Boolean,
             resultMsg: Message
         ): Boolean {
-            // Load window.open() target in the same webview
             val throwaway = WebView(view.context).apply {
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
@@ -576,6 +552,8 @@ class InAppBrowserDialog(
                         request: WebResourceRequest
                     ): Boolean {
                         view.loadUrl(request.url.toString())
+                        v.stopLoading()
+                        v.destroy()
                         return true
                     }
                 }
@@ -584,10 +562,6 @@ class InAppBrowserDialog(
             transport.webView = throwaway
             resultMsg.sendToTarget()
             return true
-        }
-
-        override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-            return false
         }
     }
 }
