@@ -279,7 +279,19 @@ class InAppBrowserViewController: UIViewController {
                     completion(.success(String(describing: value)))
                 }
             case .failure(let error):
-                completion(.failure(error))
+                let nsError = error as NSError
+                let jsMessage = nsError.userInfo["WKJavaScriptExceptionMessage"] as? String
+                let jsLine = nsError.userInfo["WKJavaScriptExceptionLineNumber"] as? Int
+                if let jsMessage {
+                    let detail = jsLine.map { ":\($0)" } ?? ""
+                    completion(.failure(NSError(
+                        domain: nsError.domain,
+                        code: nsError.code,
+                        userInfo: [NSLocalizedDescriptionKey: "\(jsMessage)\(detail)"]
+                    )))
+                } else {
+                    completion(.failure(error))
+                }
             }
         }
     }
