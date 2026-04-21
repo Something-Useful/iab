@@ -128,6 +128,7 @@ class InAppBrowserDialog(
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             setBackgroundColor(Color.WHITE)
+            fitsSystemWindows = true
         }
 
         buildToolbar(ctx)
