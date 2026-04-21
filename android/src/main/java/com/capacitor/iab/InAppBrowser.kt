@@ -29,6 +29,7 @@ import android.webkit.JsResult
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -478,6 +479,13 @@ class InAppBrowserDialog(
                 .setOnCancelListener { handler.cancel() }
             showSafely(builder) { handler.cancel() }
         }
+
+        override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+            val message = if (detail.didCrash()) "WebView renderer crashed" else "WebView renderer killed by system"
+            delegate?.onLoadError(view.url ?: "", -1, message)
+            delegate?.onCloseRequested()
+            return true
+        }
     }
 
     private inner class BrowserChromeClient : WebChromeClient() {
@@ -552,8 +560,7 @@ class InAppBrowserDialog(
                         request: WebResourceRequest
                     ): Boolean {
                         view.loadUrl(request.url.toString())
-                        v.stopLoading()
-                        v.destroy()
+                        v.post { v.stopLoading(); v.destroy() }
                         return true
                     }
                 }
